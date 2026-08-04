@@ -1,318 +1,252 @@
-import streamlit as st
-import yfinance as yf
+# ==========================================
+# FILE: fyousou.py (修復・完全版)
+# ==========================================
+
+"""
+GMO / SBI FX クオンツAI予測ダッシュボード (fyousou.py - 完全独立スタンドアロン版)
+Yahoo Financeから主要10通貨ペアデータをリアルタイム取得し、
+機械学習(RandomForest)とテクニカル指標(SMA, RSI, MACD, ATR, Bollinger)から目標pips到達確率を算出・可視化します。
+【新機能】予測精度トラッカー(Prediction Tracker) & 継続的再学習(Continual Learning)を搭載。
+"""
+
+import os
+import json
+import logging
+import math
+import smtplib
+import urllib.request
+import urllib.parse
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
 import pandas as pd
 import numpy as np
-import json
-import os
-from datetime import datetime, timedelta
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-# =============================================================================
-# 1. ページ環境設定 & セキュリティパスワード認証システム (Passcode: 238923)
-# =============================================================================
-st.set_page_config(
-    page_title="業種別ETF & 自己進化型AI株価予測ダッシュボード",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
 
-PASSWORD = "238923"
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit
+import streamlit as st
+import plotly.graph_objects as go
 
-def check_password():
-    """セッション状態による簡易ログインパスワードチェック"""
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
+# ログ設定
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-    if not st.session_state["authenticated"]:
-        st.title("🔒 パスワード保護領域")
-        st.info("本ダッシュボードにアクセスするにはセキュリティパスワードを入力してください。")
-        col_p1, col_p2 = st.columns([2, 1])
-        with col_p1:
-            input_pass = st.text_input("パスワードを入力", type="password")
-        if st.button("ログイン認証"):
-            if input_pass == PASSWORD:
-                st.session_state["authenticated"] = True
-                st.success("認証に成功しました！画面を読み込みます...")
-                st.rerun()
-            else:
-                st.error("パスワードが正しくありません")
-        return False
-    return True
-
-if not check_password():
-    st.stop()
-
-# =============================================================================
-# 2. 銘柄辞書 & 業種別ETFマスターデータベース
-# =============================================================================
-STOCK_DICT = {
-    # 🇺🇸 アメリカ 業種別ETF & 代表銘柄
-    'XLK': {'name': 'テクノロジー業種Select ETF', 'category': '業種別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
-    'XLF': {'name': '金融業種Select ETF', 'category': '業種別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
-    'XLV': {'name': 'ヘルスケア業種Select ETF', 'category': '業種別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
-    'XLE': {'name': 'エネルギー業種Select ETF', 'category': '業種別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
-    'XLY': {'name': '一般消費財業種Select ETF', 'category': '業種別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
-    'SOXX': {'name': 'iShares 半導体株業種ETF', 'category': '業種別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
-    'SPY': {'name': 'SPDR S&P500 インデックスETF', 'category': '広域インデックスETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
-    'QQQ': {'name': 'Invesco NASDAQ100 ETF', 'category': 'ハイテクインデックスETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
-    'NVDA': {'name': 'エヌビディア (NVIDIA Corporation)', 'category': '半導体・AI', 'country': '🇺🇸 アメリカ', 'is_etf': False},
-    'MSFT': {'name': 'マイクロソフト (Microsoft Corp)', 'category': 'クラウド・AI', 'country': '🇺🇸 アメリカ', 'is_etf': False},
-    'AAPL': {'name': 'アップル (Apple Inc)', 'category': 'ハードウェア', 'country': '🇺🇸 アメリカ', 'is_etf': False},
-
-    # 🇯🇵 日本 業種別ETF & 代表優良株
-    '1615.T': {'name': 'NF TOPIX銀行業種ETF', 'category': '業種別ETF (銀行業)', 'country': '🇯🇵 日本', 'is_etf': True},
-    '1621.T': {'name': 'NF 医薬品業種ETF (TOPIX-17)', 'category': '業種別ETF (医薬品)', 'country': '🇯🇵 日本', 'is_etf': True},
-    '1622.T': {'name': 'NF 自動車・輸送機業種ETF', 'category': '業種別ETF (自動車)', 'country': '🇯🇵 日本', 'is_etf': True},
-    '1625.T': {'name': 'NF 電機・精密業種ETF', 'category': '業種別ETF (電機)', 'country': '🇯🇵 日本', 'is_etf': True},
-    '1629.T': {'name': 'NF 商社・卸売業種ETF', 'category': '業種別ETF (商社)', 'country': '🇯🇵 日本', 'is_etf': True},
-    '1630.T': {'name': 'NF 小売業種ETF', 'category': '業種別ETF (小売)', 'country': '🇯🇵 日本', 'is_etf': True},
-    '1321.T': {'name': 'NF 日経225連動型上場投資信託', 'category': '広域インデックスETF', 'country': '🇯🇵 日本', 'is_etf': True},
-    '1570.T': {'name': 'NF 日経平均レバレッジETF', 'category': 'レバレッジETF', 'country': '🇯🇵 日本', 'is_etf': True},
-    '7203.T': {'name': 'トヨタ自動車 (Toyota Motor)', 'category': '自動車・モビリティ', 'country': '🇯🇵 日本', 'is_etf': False},
-    '6758.T': {'name': 'ソニーグループ (Sony Group)', 'category': 'エンタメ・電子部品', 'country': '🇯🇵 日本', 'is_etf': False},
-    '6861.T': {'name': 'キーエンス (Keyence)', 'category': 'FAセンサー・計測器', 'country': '🇯🇵 日本', 'is_etf': False},
-    '8035.T': {'name': '東京エレクトロン (Tokyo Electron)', 'category': '半導体製造装置', 'country': '🇯🇵 日本', 'is_etf': False},
-    '8306.T': {'name': '三菱UFJフィナンシャルG', 'category': 'メガバンク・金融', 'country': '🇯🇵 日本', 'is_etf': False},
-
-    # 🇨🇳 中国 業種別ETF & 代表銘柄
-    '3033.HK': {'name': 'Hang Seng TECH (恒生科技業種) ETF', 'category': '業種別ETF', 'country': '🇨🇳 中国', 'is_etf': True},
-    '2828.HK': {'name': 'Hang Seng China Enterprises (H株) ETF', 'category': '業種別ETF', 'country': '🇨🇳 中国', 'is_etf': True},
-    '3169.HK': {'name': 'China Consumer (中国消費財業種) ETF', 'category': '業種別ETF', 'country': '🇨🇳 中国', 'is_etf': True},
-    '2833.HK': {'name': 'Hang Seng Index (恒生指数) ETF', 'category': '広域インデックスETF', 'country': '🇨🇳 中国', 'is_etf': True},
-    '0700.HK': {'name': 'Tencent Holdings (騰訊控股 / テンセント)', 'category': 'ネット・ゲーム', 'country': '🇨🇳 中国', 'is_etf': False},
-    '9988.HK': {'name': 'Alibaba Group (阿里巴巴 / アリババ)', 'category': 'EC・クラウド', 'country': '🇨🇳 中国', 'is_etf': False},
-    '1211.HK': {'name': 'BYD Company (比亜迪 / ビーワイディー)', 'category': 'EV・車載電池', 'country': '🇨🇳 中国', 'is_etf': False},
-    '600519.SS': {'name': 'Kweichow Moutai (貴州茅台酒 / マウタイ)', 'category': '高級白酒・消費財', 'country': '🇨🇳 中国', 'is_etf': False}
-}
-
-COUNTRY_CANDIDATES = {
-    '🇺🇸 アメリカ': ['XLK', 'XLF', 'XLV', 'XLE', 'XLY', 'SOXX', 'SPY', 'QQQ', 'NVDA', 'MSFT', 'AAPL'],
-    '🇯🇵 日本': ['1615.T', '1621.T', '1622.T', '1625.T', '1629.T', '1630.T', '1321.T', '1570.T', '7203.T', '6758.T', '6861.T', '8035.T', '8306.T'],
-    '🇨🇳 中国': ['3033.HK', '2828.HK', '3169.HK', '2833.HK', '0700.HK', '9988.HK', '1211.HK', '600519.SS']
-}
-
-BUILT_TO_LAST_DATA = [
-    {'symbol': 'MSFT', 'name': 'マイクロソフト', 'moat': 'Wide (超強固)', 'roe': '38.5%', 'operating_margin': '44.6%', 'growth': '+15.2%', 'eval': 'S (最高ランク)'},
-    {'symbol': 'AAPL', 'name': 'アップル', 'moat': 'Wide (エコシステム)', 'roe': '147.2%', 'operating_margin': '30.7%', 'growth': '+8.1%', 'eval': 'S (最高ランク)'},
-    {'symbol': 'BRK-B', 'name': 'バークシャー・ハサウェイ', 'moat': 'Wide (多角化・現金)', 'roe': '14.1%', 'operating_margin': '18.9%', 'growth': '+11.5%', 'eval': 'S (最高ランク)'},
-    {'symbol': '7203.T', 'name': 'トヨタ自動車', 'moat': 'Wide (生産方式・ブランド)', 'roe': '11.8%', 'operating_margin': '10.2%', 'growth': '+21.4%', 'eval': 'A+ (優良)'},
-    {'symbol': '6758.T', 'name': 'ソニーグループ', 'moat': 'Wide (コンテンツ・IP)', 'roe': '13.5%', 'operating_margin': '11.8%', 'growth': '+12.0%', 'eval': 'A+ (優良)'},
-    {'symbol': '6861.T', 'name': 'キーエンス', 'moat': 'Wide (高利益率・直販)', 'roe': '13.2%', 'operating_margin': '52.1%', 'growth': '+11.1%', 'eval': 'S (最高ランク)'}
+# 1. SBI / GMO為替メインレート 10通貨ペアの定義
+SBI_PAIRS = [
+    {"symbol": "AUDUSD=X", "ticker": "AUDUSD=X", "name": "AUD/USD", "disp": "豪ドル/米ドル", "type": "USD", "pip_scale": 0.0001, "target_pips": 250},
+    {"symbol": "USDJPY=X", "ticker": "USDJPY=X", "name": "USD/JPY", "disp": "米ドル/円", "type": "JPY", "pip_scale": 0.01, "target_pips": 250},
+    {"symbol": "EURJPY=X", "ticker": "EURJPY=X", "name": "EUR/JPY", "disp": "ユーロ/円", "type": "JPY", "pip_scale": 0.01, "target_pips": 250},
+    {"symbol": "GBPJPY=X", "ticker": "GBPJPY=X", "name": "GBP/JPY", "disp": "ポンド/円", "type": "JPY", "pip_scale": 0.01, "target_pips": 250},
+    {"symbol": "AUDJPY=X", "ticker": "AUDJPY=X", "name": "AUD/JPY", "disp": "豪ドル/円", "type": "JPY", "pip_scale": 0.01, "target_pips": 250},
+    {"symbol": "NZDJPY=X", "ticker": "NZDJPY=X", "name": "NZD/JPY", "disp": "NZドル/円", "type": "JPY", "pip_scale": 0.01, "target_pips": 250},
+    {"symbol": "CADJPY=X", "ticker": "CADJPY=X", "name": "CAD/JPY", "disp": "カナダドル/円", "type": "JPY", "pip_scale": 0.01, "target_pips": 250},
+    {"symbol": "CHFJPY=X", "ticker": "CHFJPY=X", "name": "CHF/JPY", "disp": "スイスフラン/円", "type": "JPY", "pip_scale": 0.01, "target_pips": 250},
+    {"symbol": "GBPUSD=X", "ticker": "GBPUSD=X", "name": "GBP/USD", "disp": "ポンド/米ドル", "type": "USD", "pip_scale": 0.0001, "target_pips": 250},
+    {"symbol": "EURUSD=X", "ticker": "EURUSD=X", "name": "EUR/USD", "disp": "ユーロ/米ドル", "type": "USD", "pip_scale": 0.0001, "target_pips": 250}
 ]
 
-# =============================================================================
-# 3. 高度データ取得 & パイプライン (テクニカル指標 + 機械学習用特徴量)
-# =============================================================================
-@st.cache_data(ttl=3600)
-def fetch_stock_data(ticker):
-    """yfinance経由で株価を取得し、各種テクニカル指標と機械学習用特徴量を計算"""
+GMO_PAIRS = {pair["name"]: pair for pair in SBI_PAIRS}
+TARGET_PAIRS = SBI_PAIRS
+HISTORY_FILE = "prediction_history.csv"
+
+
+# --- 2. 予測ログ蓄積・答え合わせ (Outcome Evaluator) & CSV管理モジュール ---
+def load_prediction_history() -> pd.DataFrame:
+    """保存された予測ログ履歴を読み込む"""
+    cols = ["id", "timestamp", "pair_name", "price", "target_pips", "pred_direction", "long_prob", "short_prob", "outcome", "evaluated_at"]
+    if os.path.exists(HISTORY_FILE):
+        try:
+            df = pd.read_csv(HISTORY_FILE)
+            for col in cols:
+                if col not in df.columns:
+                    df[col] = None
+            return df
+        except Exception as e:
+            logging.error(f"Failed to load prediction history CSV: {e}")
+    return pd.DataFrame(columns=cols)
+
+
+def save_prediction_history(df: pd.DataFrame):
+    """予測ログ履歴をCSVに保存"""
     try:
-        df = yf.download(ticker, period="2y", interval="1d", progress=False)
-        if df.empty or len(df) < 50:
-            return None, None
-        
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        # 1. 移動平均線 (SMA)
-        df['SMA20'] = df['Close'].rolling(window=20).mean()
-        df['SMA50'] = df['Close'].rolling(window=50).mean()
-        df['SMA200'] = df['Close'].rolling(window=200).mean()
-
-        # 2. RSI (14日)
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-9)
-        df['RSI'] = 100 - (100 / (1 + rs))
-
-        # 3. MACD (12, 26, 9)
-        ema12 = df['Close'].ewm(span=12, adjust=False).mean()
-        ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = ema12 - ema26
-        df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-        df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
-
-        # 4. ボリンジャーバンド (20日, 2σ)
-        df['BB_Upper'] = df['SMA20'] + (df['Close'].rolling(window=20).std() * 2)
-        df['BB_Lower'] = df['SMA20'] - (df['Close'].rolling(window=20).std() * 2)
-
-        # 5. ATR (Average True Range - 14日)
-        high_low = df['High'] - df['Low']
-        high_close = (df['High'] - df['Close'].shift()).abs()
-        low_close = (df['Low'] - df['Close'].shift()).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df['ATR'] = tr.rolling(window=14).mean()
-
-        # 6. 乖離率 & ボラティリティ
-        df['MA_Disparity_20'] = ((df['Close'] - df['SMA20']) / df['SMA20']) * 100
-        df['Volatility_20'] = df['Close'].pct_change().rolling(window=20).std() * 100
-
-        # 未来の株価上昇ラベル作成 (MLの教師データ: 20営業日後の上昇が+2%以上か)
-        df['Target_20d'] = (df['Close'].shift(-20) > df['Close'] * 1.02).astype(int)
-
-        latest = df.iloc[-1]
-        features = {
-            'RSI': float(latest['RSI']),
-            'MACD_Hist': float(latest['MACD_Hist']),
-            'MA_Disparity_20': float(latest['MA_Disparity_20']),
-            'Volatility_20': float(latest['Volatility_20']),
-            'ATR': float(latest['ATR']) if not pd.isna(latest['ATR']) else float(latest['Close']) * 0.02,
-            'Last_Close': float(latest['Close']),
-            'SMA20': float(latest['SMA20']) if not pd.isna(latest['SMA20']) else float(latest['Close']),
-            'SMA50': float(latest['SMA50']) if not pd.isna(latest['SMA50']) else float(latest['Close']),
-            'SMA200': float(latest['SMA200']) if not pd.isna(latest['SMA200']) else float(latest['Close'])
-        }
-        return df, features
+        df.to_csv(HISTORY_FILE, index=False)
     except Exception as e:
-        st.warning(f"データ取得エラー ({ticker}): {e}")
-        return None, None
+        logging.error(f"Failed to save prediction history CSV: {e}")
 
-# =============================================================================
-# 4. 機械学習 (RandomForest) & 多期間予測エンジン
-# =============================================================================
-def train_and_predict_ml(df, features):
-    """過去データに基づきRandomForest分類モデルを学習し上昇確率を予測"""
-    feature_cols = ['RSI', 'MACD_Hist', 'MA_Disparity_20', 'Volatility_20']
-    
-    clean_df = df.dropna(subset=feature_cols + ['Target_20d']).copy()
-    if len(clean_df) < 60:
-        # データ不足時のルールベース予測
-        prob_up = float(np.clip(0.50 + (features['RSI'] - 50) * 0.005 + features['MACD_Hist'] * 0.08, 0.35, 0.85))
-        importances = {'RSI': 0.4, 'MACD_Hist': 0.3, 'MA_Disparity_20': 0.15, 'Volatility_20': 0.15}
-        return prob_up, importances
 
-    X = clean_df[feature_cols]
-    y = clean_df['Target_20d']
+def record_current_predictions(results: list, target_pips: float):
+    """現在の予測結果をログに保存"""
+    df_hist = load_prediction_history()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_rows = []
 
-    model = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=5)
-    model.fit(X, y)
+    for r in results:
+        pair_name = r["name"]
+        price = r["price"]
+        long_p = r["long_prob"]
+        short_p = r["short_prob"]
 
-    latest_X = pd.DataFrame([[features['RSI'], features['MACD_Hist'], features['MA_Disparity_20'], features['Volatility_20']]], columns=feature_cols)
-    prob_up = float(model.predict_proba(latest_X)[0][1])
+        if long_p >= short_p:
+            pred_dir = "Long"
+        else:
+            pred_dir = "Short"
 
-    importances = dict(zip(feature_cols, model.feature_importances_))
-    return prob_up, importances
+        if not df_hist.empty:
+            recent_same = df_hist[(df_hist["pair_name"] == pair_name) & (df_hist["timestamp"] > (pd.to_datetime(now_str) - pd.Timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S"))]
+            if not recent_same.empty:
+                continue
 
-def calculate_multi_horizon(last_close, prob_up):
-    """1ヶ月, 3ヶ月, 6ヶ月, 12ヶ月先の株価予測"""
-    horizons = [
-        {'period': '1ヶ月先', 'mult': 0.10},
-        {'period': '3ヶ月先', 'mult': 0.28},
-        {'period': '6ヶ月先', 'mult': 0.45},
-        {'period': '12ヶ月先', 'mult': 0.65}
-    ]
-    results = []
-    for h in horizons:
-        expected_change = (prob_up - 0.5) * h['mult']
-        target_price = round(last_close * (1 + expected_change), 2)
-        return_pct = round(expected_change * 100, 2)
-        results.append({
-            '対象期間': h['period'],
-            '上昇勝率 (Prob)': f"{round(prob_up * 100, 1)}%",
-            '予測目標株価': f"{target_price:,.2f}",
-            '予想リターン (%)': f"{return_pct:+.2f}%"
+        rec_id = f"{pair_name}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{len(df_hist) + len(new_rows) + 1}"
+        new_rows.append({
+            "id": rec_id,
+            "timestamp": now_str,
+            "pair_name": pair_name,
+            "price": price,
+            "target_pips": target_pips,
+            "pred_direction": pred_dir,
+            "long_prob": long_p,
+            "short_prob": short_p,
+            "outcome": -1,
+            "evaluated_at": ""
         })
-    return results
 
-# =============================================================================
-# 5. メインダッシュボード UI
-# =============================================================================
-st.title("📈 業種別ETF & 自己進化型AI株価予測ダッシュボード")
+    if new_rows:
+        df_new = pd.DataFrame(new_rows)
+        df_updated = pd.concat([df_hist, df_new], ignore_index=True)
+        save_prediction_history(df_updated)
+        return len(new_rows)
+    return 0
 
-# サイドバーによる銘柄選択
-st.sidebar.header("🔍 分析設定")
-selected_country = st.sidebar.selectbox("国・地域を選択", list(COUNTRY_CANDIDATES.keys()))
 
-tickers_in_country = COUNTRY_CANDIDATES[selected_country]
-ticker_options = {t: f"{t} | {STOCK_DICT[t]['name']}" for t in tickers_in_country if t in STOCK_DICT}
+def evaluate_prediction_outcomes(pairs_data_map: dict) -> pd.DataFrame:
+    """過去の未確定予測ログに対し正解判定を行う"""
+    df_hist = load_prediction_history()
+    if df_hist.empty:
+        return df_hist
 
-selected_ticker = st.sidebar.selectbox(
-    "銘柄 / ETFを選択",
-    options=list(ticker_options.keys()),
-    format_func=lambda x: ticker_options[x]
-)
+    updated = False
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ログアウトボタン
-if st.sidebar.button("🔒 ログアウト"):
-    st.session_state["authenticated"] = False
-    st.rerun()
+    for idx, row in df_hist.iterrows():
+        if row["outcome"] != -1 and not pd.isna(row["outcome"]):
+            continue
 
-# タブ構成
-tab1, tab2, tab3 = st.tabs(["📊 個別AI分析 & 予測", "🏰 ビジョナリー優良株", "🌐 収録銘柄マスター一覧"])
+        pair_name = row["pair_name"]
+        pred_time = pd.to_datetime(row["timestamp"])
+        entry_price = float(row["price"])
+        target_pips = float(row["target_pips"]) if not pd.isna(row["target_pips"]) else 250.0
+        pred_dir = str(row["pred_direction"])
 
-# -----------------------------------------------------------------------------
-# タブ1: 個別AI分析 & 予測
-# -----------------------------------------------------------------------------
-with tab1:
-    stock_info = STOCK_DICT[selected_ticker]
-    st.subheader(f"分析対象: {stock_info['name']} ({selected_ticker})")
-    st.caption(f"カテゴリ: {stock_info['category']} | 国: {stock_info['country']}")
+        pair_config = GMO_PAIRS.get(pair_name)
+        if not pair_config:
+            continue
 
-    with st.spinner("リアルタイム株価を取得・AI解析中..."):
-        df, features = fetch_stock_data(selected_ticker)
+        pip_scale = pair_config["pip_scale"]
+        target_val = target_pips * pip_scale
 
-    if df is not None and features is not None:
-        # 指標表示
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("最新終値", f"{features['Last_Close']:,.2f}")
-        c2.metric("RSI (14日)", f"{features['RSI']:.1f}")
-        c3.metric("20日移動平均乖離率", f"{features['MA_Disparity_20']:+.2f}%")
-        c4.metric("ボラティリティ (20日)", f"{features['Volatility_20']:.2f}%")
+        if pair_name in pairs_data_map and not pairs_data_map[pair_name].empty:
+            chart_df = pairs_data_map[pair_name]
+            sub_df = chart_df[chart_df.index >= pred_time]
+            if len(sub_df) < 1:
+                continue
 
-        st.markdown("---")
+            max_high = sub_df["High"].max()
+            min_low = sub_df["Low"].min()
 
-        # AI予測セクション
-        st.subheader("🤖 AI (RandomForest) 多期間予測結果")
-        prob_up, importances = train_and_predict_ml(df, features)
-        multi_horizon = calculate_multi_horizon(features['Last_Close'], prob_up)
+            if pred_dir == "Long":
+                if (max_high - entry_price) >= target_val:
+                    df_hist.at[idx, "outcome"] = 1
+                    df_hist.at[idx, "evaluated_at"] = now_str
+                    updated = True
+                elif len(sub_df) >= 15:
+                    df_hist.at[idx, "outcome"] = 0
+                    df_hist.at[idx, "evaluated_at"] = now_str
+                    updated = True
+            elif pred_dir == "Short":
+                if (entry_price - min_low) >= target_val:
+                    df_hist.at[idx, "outcome"] = 1
+                    df_hist.at[idx, "evaluated_at"] = now_str
+                    updated = True
+                elif len(sub_df) >= 15:
+                    df_hist.at[idx, "outcome"] = 0
+                    df_hist.at[idx, "evaluated_at"] = now_str
+                    updated = True
 
-        col_left, col_right = st.columns([3, 2])
+    if updated:
+        save_prediction_history(df_hist)
 
-        with col_left:
-            st.markdown("##### 📈 期間別ターゲット目標価格 & 予想リターン")
-            st.dataframe(pd.DataFrame(multi_horizon), hide_index=True, use_container_width=True)
+    return df_hist
 
-        with col_right:
-            st.markdown("##### 🧠 AIモデルの特徴量寄与度 (Feature Importance)")
-            imp_df = pd.DataFrame([
-                {'指標': k, '寄与度': f"{v*100:.1f}%"} for k, v in importances.items()
-            ]).sort_values(by='寄与度', ascending=False)
-            st.dataframe(imp_df, hide_index=True, use_container_width=True)
 
-        st.markdown("---")
+# --- 3. メール送信機能 ---
+def send_smtp_email(
+    smtp_server: str,
+    smtp_port: int,
+    sender_email: str,
+    sender_password: str,
+    receiver_email: str = "huashenfo@gmail.com",
+    subject: str = "",
+    body_html: str = ""
+) -> bool:
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["From"] = sender_email
+        msg["To"] = receiver_email
+        msg["Subject"] = subject
 
-        # チャート表示
-        st.subheader("📉 株価チャート & 移動平均線 (過去2年)")
-        chart_df = df[['Close', 'SMA20', 'SMA50']].dropna()
-        st.line_chart(chart_df)
+        html_part = MIMEText(body_html, "html", "utf-8")
+        msg.attach(html_part)
 
-    else:
-        st.error("株価データの取得に失敗しました。時間をおいて再試行するか、別の銘柄を選択してください。")
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
+                server.login(sender_email, sender_password)
+                server.sendmail(sender_email, receiver_email, msg.as_string())
+        else:
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.starttls()
+                server.login(sender_email, sender_password)
+                server.sendmail(sender_email, receiver_email, msg.as_string())
 
-# -----------------------------------------------------------------------------
-# タブ2: ビジョナリー優良株
-# -----------------------------------------------------------------------------
-with tab2:
-    st.subheader("🏰 ビジョナリー・カンパニー（超強固な競合優位性を持つ銘柄）")
-    st.write("「経済の堀 (Economic Moat)」を持ち、長期的・継続的に高い資本効率（ROE）を維持できるグローバル優良企業群です。")
-    st.dataframe(pd.DataFrame(BUILT_TO_LAST_DATA), use_container_width=True, hide_index=True)
+        logging.info(f"Email successfully sent to {receiver_email}")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to send email: {e}")
+        return False
 
-# -----------------------------------------------------------------------------
-# タブ3: 収録銘柄マスター一覧
-# -----------------------------------------------------------------------------
-with tab3:
-    st.subheader("🌐 収録銘柄 & 業種別ETFマスターデータベース")
-    master_rows = []
-    for sym, info in STOCK_DICT.items():
-        master_rows.append({
-            'シンボル': sym,
-            '銘柄・ETF名': info['name'],
-            'カテゴリ': info['category'],
-            '国/地域': info['country'],
-            '種別': 'ETF' if info['is_etf'] else '個別株'
-        })
-    st.dataframe(pd.DataFrame(master_rows), use_container_width=True, hide_index=True)
+
+def build_signal_email_html(signals_df: pd.DataFrame, threshold_pct: float = 65.0) -> str:
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows_html = ""
+    for idx, row in signals_df.iterrows():
+        is_highlight = row.get("long_prob", 0) >= threshold_pct or row.get("short_prob", 0) >= threshold_pct
+        bg_style = "background-color: #f0fdf4;" if is_highlight else ""
+        
+        rows_html += f"""
+        <tr style="{bg_style} border-bottom: 1px solid #e5e7eb;">
+            <td style="padding: 10px; font-weight: bold;">{row.get('name', '')} ({row.get('display_name', '')})</td>
+            <td style="padding: 10px; color: #2563eb; font-weight: bold;">{row.get('price', 0)}</td>
+            <td style="padding: 10px; color: #16a34a; font-weight: bold;">{row.get('long_prob', 0)}%</td>
+            <td style="padding: 10px; color: #dc2626; font-weight: bold;">{row.get('short_prob', 0)}%</td>
+            <td style="padding: 10px;">{row.get('rsi', 50)}</td>
+            <td style="padding: 10px;">{row.get('atr_pips', 0)} pips</td>
+        </tr>
+        """
+
+    return f"""
+    <div style="font-family: sans-serif; max-width: 650px; margin: auto; border: 1px solid #e5e7eb; padding: 20px; border-radius: 8px;">
+        <h2 style="color: #1e3a8a;">📈 GMO / SBI FX クオンツAI 到達確率通知</h2>
+        <p style="color: #6b7280; font-size: 13px;">計測日時: {now_str}</p>
+        <p>送信先: huashenfo@gmail.com</p>
+        <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 14px;">
+            <thead>
+                <tr style="background-color: #1e293b; color: white;">
+                    <th style="padding: 10px;">通貨ペア</th>
+                    <th style="padding: 10px;">現在値</th>
+                    <th style="padding: 10px;">買い確率</th>
+                    <th style="padd
