@@ -3,3 +3,6 @@ google-generativeai
 Pillow
 streamlit
 yfinance
+streamlit
+yfinance
+scikit-learn
