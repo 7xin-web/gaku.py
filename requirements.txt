@@ -6,3 +6,8 @@ yfinance
 streamlit
 yfinance
 scikit-learn
+streamlit
+yfinance
+scikit-learn
+pandas
+numpy
