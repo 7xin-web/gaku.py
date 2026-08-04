@@ -13,6 +13,6 @@ pandas
 numpy
 streamlit
 yfinance
-scikit-learn
+streamlit
+plotly
 pandas
-numpy
