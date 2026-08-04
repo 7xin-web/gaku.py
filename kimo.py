@@ -47,7 +47,7 @@ if not check_password():
 STOCK_DICT = {
     # 🇺🇸 アメリカ 業種別ETF & 代表銘柄
     'XLK': {'name': 'テクノロジー業種Select ETF', 'category': '業種別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
-    'XLF': {'name': '金融業種Select ETF', 'category': '業种別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
+    'XLF': {'name': '金融業種Select ETF', 'category': '業種別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
     'XLV': {'name': 'ヘルスケア業種Select ETF', 'category': '業種別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
     'XLE': {'name': 'エネルギー業種Select ETF', 'category': '業種別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
     'XLY': {'name': '一般消費財業種Select ETF', 'category': '業種別ETF', 'country': '🇺🇸 アメリカ', 'is_etf': True},
@@ -195,4 +195,97 @@ def calculate_multi_horizon(last_close, prob_up):
 
 # =============================================================================
 # 5. メインダッシュボード UI
-# =========================================================================
+# =============================================================================
+st.title("📈 業種別ETF & 自己進化型AI株価予測ダッシュボード")
+
+# サイドバーによる銘柄選択
+st.sidebar.header("🔍 分析設定")
+selected_country = st.sidebar.selectbox("国・地域を選択", list(COUNTRY_CANDIDATES.keys()))
+
+tickers_in_country = COUNTRY_CANDIDATES[selected_country]
+ticker_options = {t: f"{t} | {STOCK_DICT[t]['name']}" for t in tickers_in_country if t in STOCK_DICT}
+
+selected_ticker = st.sidebar.selectbox(
+    "銘柄 / ETFを選択",
+    options=list(ticker_options.keys()),
+    format_func=lambda x: ticker_options[x]
+)
+
+# ログアウトボタン
+if st.sidebar.button("🔒 ログアウト"):
+    st.session_state["authenticated"] = False
+    st.rerun()
+
+# タブ構成
+tab1, tab2, tab3 = st.tabs(["📊 個別AI分析 & 予測", "🏰 ビジョナリー優良株", "🌐 収録銘柄マスター一覧"])
+
+# -----------------------------------------------------------------------------
+# タブ1: 個別AI分析 & 予測
+# -----------------------------------------------------------------------------
+with tab1:
+    stock_info = STOCK_DICT[selected_ticker]
+    st.subheader(f"分析対象: {stock_info['name']} ({selected_ticker})")
+    st.caption(f"カテゴリ: {stock_info['category']} | 国: {stock_info['country']}")
+
+    with st.spinner("リアルタイム株価を取得・AI解析中..."):
+        df, features = fetch_stock_data(selected_ticker)
+
+    if df is not None and features is not None:
+        # 指標表示
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("最新終値", f"{features['Last_Close']:,.2f}")
+        c2.metric("RSI (14日)", f"{features['RSI']:.1f}")
+        c3.metric("20日移動平均乖離率", f"{features['MA_Disparity_20']:+.2f}%")
+        c4.metric("ボラティリティ", f"{features['Volatility_20']:.2f}%")
+
+        st.markdown("---")
+
+        # AI予測セクション
+        st.subheader("🤖 AI (RandomForest) 多期間予測結果")
+        prob_up, importances = run_ml_prediction(features)
+        multi_horizon = calculate_multi_horizon(features['Last_Close'], prob_up)
+
+        col_left, col_right = st.columns([3, 2])
+
+        with col_left:
+            st.markdown("##### 📈 期間別ターゲット目標価格 & 予想リターン")
+            st.dataframe(pd.DataFrame(multi_horizon), hide_index=True, use_container_width=True)
+
+        with col_right:
+            st.markdown("##### 🧠 AIモデルの特徴量寄与度")
+            imp_df = pd.DataFrame(list(importances.items()), columns=['指標', '寄与度']).sort_values(by='寄与度', ascending=False)
+            st.dataframe(imp_df, hide_index=True, use_container_width=True)
+
+        st.markdown("---")
+
+        # チャート表示
+        st.subheader("📉 株価チャート & 移動平均線 (過去1年)")
+        chart_df = df[['Close', 'SMA20', 'SMA50']].dropna()
+        st.line_chart(chart_df)
+
+    else:
+        st.error("株価データの取得に失敗しました。時間をおいて再試行するか、別の銘柄を選択してください。")
+
+# -----------------------------------------------------------------------------
+# タブ2: ビジョナリー優良株
+# -----------------------------------------------------------------------------
+with tab2:
+    st.subheader("🏰 ビジョナリー・カンパニー（超強固な競合優位性を持つ銘柄）")
+    st.write("「経済の堀 (Economic Moat)」を持ち、長期的・継続的に高い資本効率（ROE）を維持できるグローバル優良企業群です。")
+    st.dataframe(pd.DataFrame(BUILT_TO_LAST_DATA), use_container_width=True, hide_index=True)
+
+# -----------------------------------------------------------------------------
+# タブ3: 収録銘柄マスター一覧
+# -----------------------------------------------------------------------------
+with tab3:
+    st.subheader("🌐 収録銘柄 & 業種別ETFマスターデータベース")
+    master_rows = []
+    for sym, info in STOCK_DICT.items():
+        master_rows.append({
+            'シンボル': sym,
+            '銘柄・ETF名': info['name'],
+            'カテゴリ': info['category'],
+            '国/地域': info['country'],
+            '種別': 'ETF' if info['is_etf'] else '個別株'
+        })
+    st.dataframe(pd.DataFrame(master_rows), use_container_width=True, hide_index=True)
