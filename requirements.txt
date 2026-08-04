@@ -11,3 +11,8 @@ yfinance
 scikit-learn
 pandas
 numpy
+streamlit
+yfinance
+scikit-learn
+pandas
+numpy
