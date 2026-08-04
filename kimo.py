@@ -255,4 +255,5 @@ base_return += 2.0
 if usdjpy >= 155.0 and code in ["1625", "1622", "1624"]:
 base_return += 1.8
 
-predicted_gain = np.round((base_return + np.random
+predicted_gain = np.round((base_return + np.random)
+                          
