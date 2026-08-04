@@ -172,6 +172,147 @@ def fetch_stock_data(ticker):
         return None, None
 
 # =============================================================================
-# 4. 機械学習 (RandomForest / GradientBoosting) & 多期間予測エンジン
+# 4. 機械学習 (RandomForest) & 多期間予測エンジン
 # =============================================================================
-def train_and_predict_ml(
+def train_and_predict_ml(df, features):
+    """過去データに基づきRandomForest分類モデルを学習し上昇確率を予測"""
+    feature_cols = ['RSI', 'MACD_Hist', 'MA_Disparity_20', 'Volatility_20']
+    
+    clean_df = df.dropna(subset=feature_cols + ['Target_20d']).copy()
+    if len(clean_df) < 60:
+        # データ不足時のルールベース予測
+        prob_up = float(np.clip(0.50 + (features['RSI'] - 50) * 0.005 + features['MACD_Hist'] * 0.08, 0.35, 0.85))
+        importances = {'RSI': 0.4, 'MACD_Hist': 0.3, 'MA_Disparity_20': 0.15, 'Volatility_20': 0.15}
+        return prob_up, importances
+
+    X = clean_df[feature_cols]
+    y = clean_df['Target_20d']
+
+    model = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=5)
+    model.fit(X, y)
+
+    latest_X = pd.DataFrame([[features['RSI'], features['MACD_Hist'], features['MA_Disparity_20'], features['Volatility_20']]], columns=feature_cols)
+    prob_up = float(model.predict_proba(latest_X)[0][1])
+
+    importances = dict(zip(feature_cols, model.feature_importances_))
+    return prob_up, importances
+
+def calculate_multi_horizon(last_close, prob_up):
+    """1ヶ月, 3ヶ月, 6ヶ月, 12ヶ月先の株価予測"""
+    horizons = [
+        {'period': '1ヶ月先', 'mult': 0.10},
+        {'period': '3ヶ月先', 'mult': 0.28},
+        {'period': '6ヶ月先', 'mult': 0.45},
+        {'period': '12ヶ月先', 'mult': 0.65}
+    ]
+    results = []
+    for h in horizons:
+        expected_change = (prob_up - 0.5) * h['mult']
+        target_price = round(last_close * (1 + expected_change), 2)
+        return_pct = round(expected_change * 100, 2)
+        results.append({
+            '対象期間': h['period'],
+            '上昇勝率 (Prob)': f"{round(prob_up * 100, 1)}%",
+            '予測目標株価': f"{target_price:,.2f}",
+            '予想リターン (%)': f"{return_pct:+.2f}%"
+        })
+    return results
+
+# =============================================================================
+# 5. メインダッシュボード UI
+# =============================================================================
+st.title("📈 業種別ETF & 自己進化型AI株価予測ダッシュボード")
+
+# サイドバーによる銘柄選択
+st.sidebar.header("🔍 分析設定")
+selected_country = st.sidebar.selectbox("国・地域を選択", list(COUNTRY_CANDIDATES.keys()))
+
+tickers_in_country = COUNTRY_CANDIDATES[selected_country]
+ticker_options = {t: f"{t} | {STOCK_DICT[t]['name']}" for t in tickers_in_country if t in STOCK_DICT}
+
+selected_ticker = st.sidebar.selectbox(
+    "銘柄 / ETFを選択",
+    options=list(ticker_options.keys()),
+    format_func=lambda x: ticker_options[x]
+)
+
+# ログアウトボタン
+if st.sidebar.button("🔒 ログアウト"):
+    st.session_state["authenticated"] = False
+    st.rerun()
+
+# タブ構成
+tab1, tab2, tab3 = st.tabs(["📊 個別AI分析 & 予測", "🏰 ビジョナリー優良株", "🌐 収録銘柄マスター一覧"])
+
+# -----------------------------------------------------------------------------
+# タブ1: 個別AI分析 & 予測
+# -----------------------------------------------------------------------------
+with tab1:
+    stock_info = STOCK_DICT[selected_ticker]
+    st.subheader(f"分析対象: {stock_info['name']} ({selected_ticker})")
+    st.caption(f"カテゴリ: {stock_info['category']} | 国: {stock_info['country']}")
+
+    with st.spinner("リアルタイム株価を取得・AI解析中..."):
+        df, features = fetch_stock_data(selected_ticker)
+
+    if df is not None and features is not None:
+        # 指標表示
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("最新終値", f"{features['Last_Close']:,.2f}")
+        c2.metric("RSI (14日)", f"{features['RSI']:.1f}")
+        c3.metric("20日移動平均乖離率", f"{features['MA_Disparity_20']:+.2f}%")
+        c4.metric("ボラティリティ (20日)", f"{features['Volatility_20']:.2f}%")
+
+        st.markdown("---")
+
+        # AI予測セクション
+        st.subheader("🤖 AI (RandomForest) 多期間予測結果")
+        prob_up, importances = train_and_predict_ml(df, features)
+        multi_horizon = calculate_multi_horizon(features['Last_Close'], prob_up)
+
+        col_left, col_right = st.columns([3, 2])
+
+        with col_left:
+            st.markdown("##### 📈 期間別ターゲット目標価格 & 予想リターン")
+            st.dataframe(pd.DataFrame(multi_horizon), hide_index=True, use_container_width=True)
+
+        with col_right:
+            st.markdown("##### 🧠 AIモデルの特徴量寄与度 (Feature Importance)")
+            imp_df = pd.DataFrame([
+                {'指標': k, '寄与度': f"{v*100:.1f}%"} for k, v in importances.items()
+            ]).sort_values(by='寄与度', ascending=False)
+            st.dataframe(imp_df, hide_index=True, use_container_width=True)
+
+        st.markdown("---")
+
+        # チャート表示
+        st.subheader("📉 株価チャート & 移動平均線 (過去2年)")
+        chart_df = df[['Close', 'SMA20', 'SMA50']].dropna()
+        st.line_chart(chart_df)
+
+    else:
+        st.error("株価データの取得に失敗しました。時間をおいて再試行するか、別の銘柄を選択してください。")
+
+# -----------------------------------------------------------------------------
+# タブ2: ビジョナリー優良株
+# -----------------------------------------------------------------------------
+with tab2:
+    st.subheader("🏰 ビジョナリー・カンパニー（超強固な競合優位性を持つ銘柄）")
+    st.write("「経済の堀 (Economic Moat)」を持ち、長期的・継続的に高い資本効率（ROE）を維持できるグローバル優良企業群です。")
+    st.dataframe(pd.DataFrame(BUILT_TO_LAST_DATA), use_container_width=True, hide_index=True)
+
+# -----------------------------------------------------------------------------
+# タブ3: 収録銘柄マスター一覧
+# -----------------------------------------------------------------------------
+with tab3:
+    st.subheader("🌐 収録銘柄 & 業種別ETFマスターデータベース")
+    master_rows = []
+    for sym, info in STOCK_DICT.items():
+        master_rows.append({
+            'シンボル': sym,
+            '銘柄・ETF名': info['name'],
+            'カテゴリ': info['category'],
+            '国/地域': info['country'],
+            '種別': 'ETF' if info['is_etf'] else '個別株'
+        })
+    st.dataframe(pd.DataFrame(master_rows), use_container_width=True, hide_index=True)
